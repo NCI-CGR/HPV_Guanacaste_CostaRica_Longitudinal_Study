@@ -109,7 +109,6 @@ rule bgzip_vcfs:
         shell('bcftools index {output.low}')
 
 
-# if concatenating the germline vcf and lowAF vcf, use the pre-annotated vcf with padding removed
 rule concat_vcfs:
     input:
         germ = 'bgzip_vcf/{sample_only}.germline.vcf.gz',
@@ -123,7 +122,6 @@ rule concat_vcfs:
 
 
 
-# also switching to no-blanks here so that blanks are not delivered
 rule lowaf_annotate:
     #input: rules.concat_vcfs.output
     input: 'lowaf_tvc_vcf/{sample_only}.tvc_no_pad.vcf'
@@ -141,7 +139,7 @@ rule lowaf_annotate:
                 -stats {output[1]} \
                 -c {params.snpeff}/snpEff.config {params.db} {input} > {output[0]}')
 
-#--------------------------------------------------------------------------
+
 rule lowaf_snpeff_report:
     input: expand('lowaf_tvc_ann/{sample_only}_snpEff.summary.lowaf.csv', sample_only=samples_only)
     output: 'multiqc/snpeff_report_lowaf.html'

@@ -18,7 +18,7 @@ shell.executable('bash')
 
 
 # set some universal reference variables based on the config file
-hpv_ref = config['hpv_reference'] # currently, all bams are initially mapped to alpha reference
+hpv_ref = config['hpv_reference'] 
 hpv_types = sorted(config['hpv_types']) # list of just the type numbers (e.g. ['16, '31', '35'])
 # TODO - check if this is needed. check if we can throw out glu yet.
 cov_dev = config['cov_dev'] # this is used for glu coverage script
@@ -26,7 +26,6 @@ GENES = config['genes'] # list of genes in gtf
 
 # create a dictionary of the true length of each type's genome
 # note that this dictionary has HPV##_Ref as the key and not just the list of numbers that's in hpv_types!
-# even if using the universal panel, all 13 HR types should be listed in the config file.
 bed = {} # bed['HPV16_Ref'] = 7906
 for hpv in hpv_types:
     with open(config['single_len_bed'] %hpv, 'r') as len_file:
@@ -59,15 +58,6 @@ if len(blanks) > 0:
         # if there are multiple blanks with the same name, only the first is archived
 new_blankIDs = b.keys()
 
-
-
-#### Run preflight tests to ensure the parsing works and all files are included ####
-TARGETS = ['%s.preflight_check.txt' %config['project_name'],
-            'refs/%s_pipeline_version.txt' %config['project_name']
-            ]
-
-
-#### If preflight check has been approved, run the selected workflows and add targets to rule all ####
 
 include: 'config/targets_Snakefile'
 for wf in config['workflows']:
