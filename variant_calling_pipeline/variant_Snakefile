@@ -1,0 +1,352 @@
+# vim: ft=python
+
+configfile: 'config/hpv_config.yaml'
+workdir: os.environ['PWD']
+shell.executable('bash')
+
+localrules: var_all
+
+
+rule var_all:
+    input: variant_targets
+
+
+rule variant_call:
+    input:
+        bam = 'mapq_filter/{sampleID}.filtered.bam',
+        ampbed = 'refs/%s.amplicon.bed' %config['project_name'],
+        lenbed = 'refs/%s.len.bed' %config['project_name'],
+        param = 'refs/%s.germline.tvc.json' %config['project_name']
+    output:
+        vcf = 'tvc/{sampleID}/TSVC_variants.vcf',
+        bam = 'tvc/{sampleID}/{sampleID}.ptrim.bam'
+    threads: 2
+    params:
+        pipe = config["vc_pipe"],
+        out = ' tvc/{sampleID}',
+        vc_bin = config["vc_bin"],
+    run:
+        shell('python {params.pipe} \
+        --input-bam {input.bam} \
+        --postprocessed-bam {output.bam} \
+        --primer-trim-bed {input.ampbed} \
+        --reference-fasta {hpv_ref} \
+        --num-threads {threads} \
+        --output-dir {params.out} \
+        --parameters-file {input.param} \
+        --bin-dir {params.vc_bin} \
+        --region-bed {input.lenbed}')
+
+# Adjust the position of the variant called by considering the 400 bp padding
+# at the end of the genome
+rule adjust_padding:
+    input: rules.variant_call.output[0] # the vcf
+    output: 'tvc_vcf/{sampleID}.tvc_no_pad.vcf'
+    params: temp = 'temp/{sampleID}.temp.vcf'
+    run:
+        if config['padding'] == False:
+            shell('cd tvc_vcf; ln -s ../{input} {wildcards.sampleID}.tvc_no_pad.vcf')
+        else:
+            vcf = open(input[0], 'r')
+            outfile = open(output[0], 'w')
+            need_sort = False
+
+            for line in vcf:
+                if line.startswith('#'):
+                    outfile.write(line)
+                else:
+                    hpvtype = line.split()[0]
+                    hpv_len = bed[hpvtype]
+                    loc = line.split()[1]
+                    if int(loc) > hpv_len:
+                        new_loc = int(loc) - hpv_len
+                        outfile.write(line.replace(loc, str(new_loc), 1))
+                        need_sort = True
+                    else:
+                        outfile.write(line)
+            vcf.close()
+            outfile.close()
+
+            if need_sort == True:
+                shell('vcf-sort -c {output} > {params.temp}')
+                shell('mv {params.temp} {output}')
+
+
+# removes human reads
+rule hpv_only_bam:
+    input:
+        rules.variant_call.output[1], # the ptrim bam
+        'refs/%s.len.bed' %config['project_name']
+    output: 'ptrim_hpv/{sampleID}.hpv.bam'
+    run:
+        shell('samtools view -h -L {input[1]} {input[0]} | samtools view -bS -o {output}')
+        shell('samtools index {output}')
+
+# Calculate per-base coverage
+rule mosdepth_all: 
+    input:
+        bam = rules.hpv_only_bam.output,
+        bed = 'refs/%s.amplicon.bed' %config['project_name']
+    output: 
+        'mosdepth_all/{sampleID}.all.per-base.bed',
+        'mosdepth_all/{sampleID}.all.quantized.bed',
+        'mosdepth_all/{sampleID}.all.thresholds.bed'
+    threads: 4
+    params:
+        thresh = config['mosdepth_thresh'],
+        quant = config['mosdepth_quant']
+    run:
+        shell('touch {input.bam}.bai') 
+        shell('mosdepth -t {threads} --by {input.bed} --thresholds {params.thresh} --quantize {params.quant} mosdepth_all/{wildcards.sampleID}.all {input.bam}')
+        shell('gunzip {output[0]}.gz')
+        shell('gunzip {output[1]}.gz')
+        shell('gunzip {output[2]}.gz')
+
+# Generate consensus fasta sequences (1 per sample per type)
+rule fasta:
+    input:
+        'mosdepth_all/{sample_only}.all.per-base.bed', 
+        'tvc_vcf/{sample_only}.tvc_no_pad.vcf', 
+        expand('refs/HPV{hpv_type}.fasta', hpv_type=hpv_types)
+    output:
+        expand('fasta/{{sample_only}}_HPV{hpv_type}.fasta', hpv_type=hpv_types), # multiple type files for one sampleID
+    run:
+        dvcf = pandas.read_table(input[1], skiprows=70, header=0)
+        dpile = pandas.read_table(input[0], names=['chrom', 'start', 'end', 'cov'], sep='\t')
+        types = list(set(dvcf['#CHROM'].tolist() + dpile['chrom'].tolist()))
+
+        # create a fasta file for each HPV type
+        for hpv in hpv_types:
+            print('type: ', hpv)
+            fa = 'refs/HPV%s.fasta' %hpv
+            fa_handle = open(fa, 'r')
+
+            seq = ''
+            for record in SeqIO.parse(fa_handle, 'fasta'):
+                seq = str(record.seq)
+                break # this also takes just the first record, it's just longer
+            fa_handle.close()
+
+            # now start looking for SNVs and deletions as per original pipeline
+            dt = dvcf[dvcf['#CHROM'] == 'HPV%s_Ref' %hpv].copy()
+
+            if config['padding'] == True:
+                newseq = seq[:len(seq)-400] # start with the ref sequence and add SNPs
+            else:
+                newseq = str(seq)
+            for idx, row in dt.iterrows():
+                (pos, ref, alt) = (int(row['POS']), row['REF'], row['ALT'].split(',')[0])
+                # Look for SNVs
+                # TODO:  add test for TVC REF matching the REF in the seq string
+                if len(ref) == len(alt):
+                    counter = 0
+                    while counter < len(ref):
+                        newseq = newseq[:pos-1+counter] + alt[counter] + newseq[pos+counter:]
+                        counter += 1
+
+                # Look for deletions
+                elif (len(ref) > len(alt)) and (len(alt) > 1): # TODO - check that alt will ever be blank...?
+                    counter = 1 # the first nt is the same as the reference, so start at +1
+                    while counter < len(ref):
+                        newseq = newseq[:pos-1] + '-' + newseq[pos:]
+                        counter += 1
+
+                # Skip insertions and other types of variation
+                else:
+                    continue
+
+
+            ## now check pileup to make sure there was enough coverage at each location
+            dp = dpile[dpile['chrom'] == 'HPV%s_Ref' %hpv].copy()
+
+            # create a list of coverage at each position - [0,0,0,0,0,4,4,4,4,8,8,9,9,...]
+            allcov = []
+            for index, row in dp.iterrows():
+                allcov += ([row['cov']] * (row['end'] - row['start']))
+
+            # rebuild into a dataframe
+            todf = {'cov': allcov}
+            dpp = pandas.DataFrame(todf)
+
+
+            # remove padding and combine with actual position
+            # also calculate depth for each individual HPV type
+            if config['padding'] == True:
+                dpp['adj_pos'] = dpp.index
+                # subtract by 401 to account for 0 indexed bed positions
+                dpp['adj_pos'] = dpp['adj_pos'].apply(lambda x: (int(x) - (len(seq)-400)) if x > (len(seq)-401) else int(x))
+                x = dpp.groupby('adj_pos')['cov'].sum()
+
+                # base calls with less than min_depth are called as N
+                x = x[x < config['tree_min_read']]
+                for pos, depth in x.iteritems():
+                    newseq = newseq[:pos] + 'N' + newseq[pos+1:]
+
+            else:
+                x = dpp[dpp['cov'] < config['tree_min_read']].copy()
+                for pos, depth in x.iterrows():
+                    newseq = newseq[:pos] + 'N' + newseq[pos+1:]
+            
+            
+            # output a fasta file for each type in each sample
+            outfile = open('fasta/%s_HPV%s.fasta' %(wildcards.sample_only, hpv), 'w')
+            outfile.write('>%s_HPV%s\n' %(wildcards.sample_only, hpv))
+            outfile.write(newseq + '\n')
+            outfile.close()
+
+
+#--------------------------------------------------------------------------
+rule fasta_cat:
+    input: expand('fasta/{sample_only}_HPV{{hpv_type}}.fasta', sample_only=samples_only)
+    output: 'cat_fasta/%s.HPV{hpv_type}.fasta' %config['project_name']
+    run:
+        shell('cat {input} > {output}')
+
+
+# This rule creates a fasta of only samples with less than X% Ns in the sequence.
+rule tree_fasta_n:
+    input: rules.fasta_cat.output
+    output: 'reports/fasta/%s.HPV{hpv_type}.N-%d.fasta' %(config['project_name'], config['tree_fasta_n'])
+    run:
+        maxN = int(config['tree_fasta_n'])
+        keep = []
+        for record in SeqIO.parse(input[0], 'fasta'):
+            d = collections.Counter(record.seq) # creates a dictionary w/counts for each character found
+            if 'N' in d.keys():
+                if (float(d['N'])/len(record.seq) * 100) < maxN:
+                    keep.append(record)
+            else:
+                keep.append(record)
+
+        # SeqIO.write doesn't let you set wrap width, so use FastaIO directly
+        outfile = open(output[0], 'w')
+        fasta_out = FastaIO.FastaWriter(outfile, wrap=None)
+        fasta_out.write_file(keep)
+        outfile.close()
+
+# make sure that if is sufficient depth for the positions that *are* covered - based only on # mapped reads
+rule tree_fasta_n_depth:
+    input: 
+        fa = 'reports/fasta/%s.HPV{hpv_type}.N-%d.fasta' %(config['project_name'], config['tree_fasta_n']),
+        idx = expand('idxstats/{sampleID}.idxstats.txt', sampleID=sampleIDs) # created in main Snakefile
+    output: 'reports/fasta/%s.HPV{hpv_type}.N-%d.passed_cov.fasta' %(config['project_name'], config['tree_fasta_n'])
+    params:
+        idxdir = 'idxstats/%s.idxstats.txt',
+        minDepth = int(config['qc_min_reads'])
+    run:
+        keep = []
+        for record in SeqIO.parse(input.fa, 'fasta'):
+            pat = record.name.rsplit('_', 1)[0] # rsplit in case the sampleID has underscores in it
+            df = pandas.read_csv(params.idxdir %pat, names=['chr', 'len', 'cov', 'x'], sep='\t')
+            df.set_index('chr', inplace=True)
+            depth = df.loc['HPV%s_Ref' %wildcards.hpv_type, 'cov']
+            if depth >= params.minDepth:
+                keep.append(record)
+
+        with open(output[0], 'w') as outfile:
+            fasta_out = FastaIO.FastaWriter(outfile, wrap=None)
+            fasta_out.write_file(keep)
+
+
+rule type_summary:
+    input: expand('mosdepth_all/{sample_only}.all.per-base.bed', sample_only=samples_only)
+    output: report('reports/type_summary.tsv')
+    run:
+        stacks = []
+        # iterate through each sample pileup and pull out which types were found
+        for sample in input:
+            df = pandas.read_table(sample, names=['chrom', 'pos', 'nt', 'cov', 'qual1', 'qual2'], sep='\t')
+            df['sampleID'] = sample.split('/')[-1].split('.')[0]
+            # note this does not consider padding yet!
+            df = df[df['cov'] >= int(config['tree_min_read'])]
+            x = df.groupby(['sampleID', 'chrom'])['pos'].count()
+            y = x.unstack()
+            stacks.append(y)
+
+        dfs = pandas.concat(stacks).fillna(0)
+        dfs.to_csv(output[0], sep='\t')
+
+
+rule annotate:
+    input: 'tvc_vcf/{sample_only}.tvc_no_pad.vcf'
+    output:
+        'tvc_ann/{sample_only}.ann.vcf',
+        'tvc_ann/{sample_only}_snpEff.summary.csv'
+    params:
+        snpeff = config['snpeff'],
+        bed = config['snpeff_bed'],
+        db = config['snpeff_db']
+    run:
+        shell('java -Xmx2g -jar {params.snpeff}/snpEff.jar \
+                -ud 0 -interval {params.bed} \
+                -csvStats \
+                -stats {output[1]} \
+                -c {params.snpeff}/snpEff.config {params.db} {input} > {output[0]}')
+
+rule snpeff_report:
+    input: expand('tvc_ann/{sample_only}_snpEff.summary.csv', sample_only=samples_only)
+    output: 'multiqc/snpeff_report.html'
+    run:
+        shell('multiqc -f -d tvc_ann -n snpeff_report -o multiqc')
+
+
+def parse_field(INFO, field):
+    # pass the entire INFO column and the field you want to isolate
+    if field + '=' in INFO:
+        return INFO.split(field + '=')[1].split(';')[0]
+    else:
+        return ''
+
+rule parse_INFO:
+    input: rules.annotate.output[0]
+    output: 'vcf_tables/{sample_only}.ann.vcf.txt'
+    run:
+        # count the number of header lines and make a list of all INFO fields
+        infile = open(input[0], 'r')
+        head_lines = 0
+        fields = []
+        for line in infile:
+            if line.startswith('#') == False:
+                break
+            else:
+                head_lines += 1
+            if 'ID=' in line:
+                field = line.split('ID=')[1].split(',')[0]
+                fields.append(field)
+        infile.close()
+
+        # import the vcf and parse the INFO column
+        try: # check for empty dataframes
+            df = pandas.read_table(input[0], skiprows=head_lines-1, sep='\t') # -1 keeps the original column headers
+            col10 = df.columns.tolist()[-1]
+            df.rename(columns={col10:'sample_col'}, inplace=True)
+            cols = df.columns.tolist()
+            df['sampleID'] = wildcards.sample_only
+            df = df[['sampleID'] + cols] # make sample ID the first column
+            field_cols = []
+            for field in fields: # create a column for each field
+                df[field] = df.INFO.apply(lambda x: parse_field(x, field))
+                field_cols.append(field)
+            df = df[['sampleID'] + cols + field_cols] # reorder the columns in the spreadsheet
+            df.to_csv(output[0], sep='\t', index=False)
+
+        except:
+            errormess = wildcards.sample_only + ': no variants called'
+            shell('echo %s > {output}' %errormess)
+            
+rule cat_vcf_tables:
+    input: expand('vcf_tables/{sample_only}.ann.vcf.txt', sample_only=samples_only)
+    output: 'reports/%s_all_vcf_tables.txt' %config['project_name']
+    run:
+        dfs = []
+        cols = []
+        for fname in input:
+            temp = pandas.read_table(fname, sep='\t')
+            cols = temp.columns
+            dfs.append(temp)
+        df = pandas.concat(dfs)
+        df = df[cols] # reorder the columns in the spreadsheet
+        df.to_csv(output[0], sep='\t', index=False)
+
+
+
